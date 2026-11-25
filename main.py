@@ -1,9 +1,9 @@
 import customtkinter as ctk
 import tkinter as tk
 import threading
+import time
 
 from tkinter import ttk, messagebox
-
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from components.system_info import (
@@ -21,6 +21,9 @@ from components.process_manager import (
     terminate_process
 )
 
+from components.performance_profiler import profile_function
+
+
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
@@ -28,7 +31,6 @@ ctk.set_default_color_theme("blue")
 class SystemResourceMonitor(ctk.CTk):
 
     def __init__(self):
-
         super().__init__()
 
         self.title("System Resource Monitor")
@@ -55,11 +57,14 @@ class SystemResourceMonitor(ctk.CTk):
 
         self.running = True
 
-        # Initialize all state before starting scheduled updates.
         self.process_loading = False
         self.cached_processes = []
         self.process_refresh_job = None
+        self.process_lock = threading.Lock()
+
         self.metrics_refresh_job = None
+        self.previous_label_values = {}
+        self.previous_chart_history = None
 
         self.create_interface()
 
@@ -68,9 +73,16 @@ class SystemResourceMonitor(ctk.CTk):
             self.on_close
         )
 
-        # Start monitoring only after the interface and state are ready.
         self.update_metrics()
         self.refresh_process_table()
+
+    def update_label(self, label, key, value):
+
+        if self.previous_label_values.get(key) != value:
+
+            label.configure(text=value)
+
+            self.previous_label_values[key] = value
 
     def create_interface(self):
 
@@ -265,31 +277,34 @@ class SystemResourceMonitor(ctk.CTk):
 
         def scroll_to_section():
 
+            if not self.running:
+                return
+
             canvas.update_idletasks()
 
-            total_height = canvas.bbox("all")[3]
+            bounds = canvas.bbox("all")
 
-            if total_height > 0:
+            if bounds:
 
-                position = target.winfo_y() / total_height
+                total_height = bounds[3]
 
-                canvas.yview_moveto(position)
+                if total_height > 0:
+
+                    position = target.winfo_y() / total_height
+
+                    canvas.yview_moveto(position)
 
         self.after(50, scroll_to_section)
 
         for key, button in self.nav_buttons.items():
 
-            if key == section:
-
-                button.configure(
-                    fg_color=self.colors["accent"]
+            button.configure(
+                fg_color=(
+                    self.colors["accent"]
+                    if key == section
+                    else "transparent"
                 )
-
-            else:
-
-                button.configure(
-                    fg_color="transparent"
-                )
+            )
 
     def create_metric_card(
         self,
@@ -385,10 +400,7 @@ class SystemResourceMonitor(ctk.CTk):
         cards_frame.pack(fill="x")
 
         for column in range(5):
-            cards_frame.grid_columnconfigure(
-                column,
-                weight=1
-            )
+            cards_frame.grid_columnconfigure(column, weight=1)
 
         self.cpu_value, self.cpu_subtitle = self.create_metric_card(
             cards_frame,
@@ -430,6 +442,7 @@ class SystemResourceMonitor(ctk.CTk):
             4
         )
 
+    @profile_function
     def update_metrics(self):
 
         if not self.running:
@@ -437,73 +450,128 @@ class SystemResourceMonitor(ctk.CTk):
 
         try:
 
+            total_start = time.perf_counter()
+
+            metrics_start = time.perf_counter()
+
             metrics = self.monitor.get_metrics()
+
+            metrics_time = time.perf_counter() - metrics_start
 
             cpu = metrics["cpu"]
             memory = metrics["memory"]
             disks = metrics["disks"]
             network = metrics["network"]
 
-            self.cpu_value.configure(
-                text=f"{cpu['usage']:.1f}%"
+            labels_start = time.perf_counter()
+
+            self.update_label(
+                self.cpu_value,
+                "cpu_value",
+                f"{cpu['usage']:.1f}%"
             )
 
-            self.cpu_subtitle.configure(
-                text=f"{cpu['cores']} cores / {cpu['threads']} threads"
+            self.update_label(
+                self.cpu_subtitle,
+                "cpu_subtitle",
+                f"{cpu['cores']} cores / {cpu['threads']} threads"
             )
 
-            self.memory_value.configure(
-                text=f"{memory['percent']:.1f}%"
+            self.update_label(
+                self.memory_value,
+                "memory_value",
+                f"{memory['percent']:.1f}%"
             )
 
-            self.memory_subtitle.configure(
-                text=(
-                    f"{format_bytes(memory['used'])} / "
-                    f"{format_bytes(memory['total'])}"
-                )
+            self.update_label(
+                self.memory_subtitle,
+                "memory_subtitle",
+                f"{format_bytes(memory['used'])} / {format_bytes(memory['total'])}"
             )
 
             if disks:
 
                 disk = disks[0]
 
-                self.disk_value.configure(
-                    text=f"{disk['percent']:.1f}%"
+                self.update_label(
+                    self.disk_value,
+                    "disk_value",
+                    f"{disk['percent']:.1f}%"
                 )
 
-                self.disk_subtitle.configure(
-                    text=(
-                        f"{disk['mountpoint']} - "
-                        f"{format_bytes(disk['free'])} free"
-                    )
+                self.update_label(
+                    self.disk_subtitle,
+                    "disk_subtitle",
+                    f"{disk['mountpoint']} - {format_bytes(disk['free'])} free"
                 )
 
             else:
 
-                self.disk_value.configure(text="N/A")
-                self.disk_subtitle.configure(
-                    text="No available drives"
+                self.update_label(
+                    self.disk_value,
+                    "disk_value",
+                    "N/A"
                 )
 
-            self.download_value.configure(
-                text=f"{format_bytes(network['download_speed'])}/s"
+                self.update_label(
+                    self.disk_subtitle,
+                    "disk_subtitle",
+                    "No available drives"
+                )
+
+            self.update_label(
+                self.download_value,
+                "download_value",
+                f"{format_bytes(network['download_speed'])}/s"
             )
 
-            self.upload_value.configure(
-                text=f"{format_bytes(network['upload_speed'])}/s"
+            self.update_label(
+                self.upload_value,
+                "upload_value",
+                f"{format_bytes(network['upload_speed'])}/s"
             )
 
-            self.charts.update(metrics["history"])
-            self.chart_canvas.draw_idle()
+            labels_time = time.perf_counter() - labels_start
+
+            chart_start = time.perf_counter()
+
+            history = metrics["history"]
+
+            current_history = {
+                key: tuple(values)
+                for key, values in history.items()
+            }
+
+            if current_history != self.previous_chart_history:
+
+                self.charts.update(history)
+
+                self.previous_chart_history = current_history
+
+                self.chart_canvas.draw_idle()
+
+            chart_time = time.perf_counter() - chart_start
+
+            total_time = time.perf_counter() - total_start
+
+            print(
+                f"[METRICS BREAKDOWN] "
+                f"Collection: {metrics_time * 1000:.2f} ms | "
+                f"Labels: {labels_time * 1000:.2f} ms | "
+                f"Charts: {chart_time * 1000:.2f} ms | "
+                f"Total: {total_time * 1000:.2f} ms"
+            )
 
         except Exception as error:
 
             print("Monitoring error:", error)
 
-        self.metrics_refresh_job = self.after(
-            2000,
-            self.update_metrics
-        )
+        if self.running:
+
+            self.metrics_refresh_job = self.after(
+                2000,
+                self.update_metrics
+            )
 
     def create_charts_section(self):
 
@@ -673,7 +741,6 @@ class SystemResourceMonitor(ctk.CTk):
         )
 
         style = ttk.Style()
-
         style.theme_use("default")
 
         style.configure(
@@ -763,15 +830,16 @@ class SystemResourceMonitor(ctk.CTk):
         )
 
     def search_process_table(self, event=None):
-
         self.update_process_table()
 
+    @profile_function
     def update_process_table(self):
 
         if not self.running:
             return
 
         try:
+
             processes = self.cached_processes
 
             search_term = self.process_search.get()
@@ -805,46 +873,98 @@ class SystemResourceMonitor(ctk.CTk):
                     sort_key
                 )
 
-            self.process_table.delete(
-                *self.process_table.get_children()
-            )
+            existing_items = {
+                self.process_table.item(item, "values")[0]: item
+                for item in self.process_table.get_children()
+            }
+
+            current_pids = set()
 
             for process in processes:
 
-                self.process_table.insert(
-                    "",
-                    "end",
-                    values=(
-                        process["pid"],
-                        process["name"],
-                        f"{process['cpu_percent']:.1f}%",
-                        f"{process['memory_percent']:.2f}%",
-                        process["status"]
-                    )
+                pid = str(process["pid"])
+                current_pids.add(pid)
+
+                values = (
+                    pid,
+                    process["name"],
+                    f"{process['cpu_percent']:.1f}%",
+                    f"{process['memory_percent']:.2f}%",
+                    process["status"]
                 )
 
+                if pid in existing_items:
+
+                    item = existing_items[pid]
+
+                    if self.process_table.item(item, "values") != values:
+                        self.process_table.item(
+                            item,
+                            values=values
+                        )
+
+                    self.process_table.move(
+                        item,
+                        "",
+                        len(current_pids) - 1
+                    )
+
+                else:
+
+                    self.process_table.insert(
+                        "",
+                        "end",
+                        values=values
+                    )
+
+            for pid, item in existing_items.items():
+
+                if pid not in current_pids:
+                    self.process_table.delete(item)
+
         except Exception as error:
+
             print("Process table error:", error)
 
     def refresh_process_table(self):
 
-        if not self.running or self.process_loading:
+        if not self.running:
             return
 
-        self.process_loading = True
+        if self.process_refresh_job is not None:
+
+            try:
+                self.after_cancel(self.process_refresh_job)
+            except tk.TclError:
+                pass
+
+        self.process_refresh_job = self.after(
+            15000,
+            self.refresh_process_table
+        )
+
+        with self.process_lock:
+
+            if self.process_loading:
+                return
+
+            self.process_loading = True
 
         def load_processes():
 
             try:
+
                 processes = get_processes()
 
                 try:
+
                     self.after(
                         0,
-                        lambda result=processes: self.finish_process_refresh(result)
+                        lambda result=processes:
+                            self.finish_process_refresh(result)
                     )
-                except RuntimeError:
-                    # The window may have closed while the worker was running.
+
+                except (RuntimeError, tk.TclError):
                     pass
 
             except Exception as error:
@@ -852,42 +972,50 @@ class SystemResourceMonitor(ctk.CTk):
                 error_message = str(error)
 
                 try:
+
                     self.after(
                         0,
-                        lambda msg=error_message: self.finish_process_refresh(
-                            None,
-                            msg
-                        )
+                        lambda msg=error_message:
+                            self.finish_process_refresh(
+                                None,
+                                msg
+                            )
                     )
-                except RuntimeError:
-                    # The window may have closed while the worker was running.
+
+                except (RuntimeError, tk.TclError):
                     pass
 
         threading.Thread(
             target=load_processes,
-            daemon=True
+            daemon=True,
+            name="ProcessCollector"
         ).start()
 
-        self.process_refresh_job = self.after(
-            15000,
-            self.refresh_process_table
-        )
-    
+    @profile_function
     def finish_process_refresh(self, processes, error=None):
 
         if not self.running:
             return
 
-        self.process_loading = False
+        with self.process_lock:
+            self.process_loading = False
 
         if error:
-            print("Process refresh error:", error)
+
+            print(
+                f"[PROCESS MANAGER] Refresh error: {error}"
+            )
+
+            return
+
+        if processes is None:
             return
 
         self.cached_processes = processes
 
         self.update_process_table()
 
+    @profile_function
     def terminate_selected_process(self):
 
         selected = self.process_table.selection()
@@ -931,7 +1059,7 @@ class SystemResourceMonitor(ctk.CTk):
                 f"{process_name} was terminated successfully."
             )
 
-            self.update_process_table()
+            self.refresh_process_table()
 
         except Exception as error:
 
@@ -1025,6 +1153,7 @@ class SystemResourceMonitor(ctk.CTk):
                 pady=(5, 0)
             )
 
+    @profile_function
     def refresh_dashboard(self):
 
         if not self.running:
@@ -1032,25 +1161,37 @@ class SystemResourceMonitor(ctk.CTk):
 
         if self.metrics_refresh_job is not None:
 
-            self.after_cancel(self.metrics_refresh_job)
+            try:
+                self.after_cancel(self.metrics_refresh_job)
+            except tk.TclError:
+                pass
 
             self.metrics_refresh_job = None
 
         self.update_metrics()
-
         self.refresh_process_table()
 
     def on_close(self):
 
+        if not self.running:
+            return
+
         self.running = False
 
-        if self.process_refresh_job is not None:
-            self.after_cancel(self.process_refresh_job)
+        for job in (
+            self.process_refresh_job,
+            self.metrics_refresh_job
+        ):
 
-        if self.metrics_refresh_job is not None:
-            self.after_cancel(self.metrics_refresh_job)
+            if job is not None:
+
+                try:
+                    self.after_cancel(job)
+                except tk.TclError:
+                    pass
 
         self.destroy()
+
 
 if __name__ == "__main__":
 
