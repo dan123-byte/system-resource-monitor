@@ -2,6 +2,7 @@ import customtkinter as ctk
 import tkinter as tk
 import threading
 import time
+import queue
 
 from tkinter import ttk, messagebox
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -63,6 +64,12 @@ class SystemResourceMonitor(ctk.CTk):
         self.process_lock = threading.Lock()
 
         self.metrics_refresh_job = None
+        self.metrics_poll_job = None
+
+        # Background metric collection state.
+        self.metrics_queue = queue.Queue()
+        self.metrics_loading = False
+
         self.previous_label_values = {}
         self.previous_chart_history = None
 
@@ -71,6 +78,11 @@ class SystemResourceMonitor(ctk.CTk):
         self.protocol(
             "WM_DELETE_WINDOW",
             self.on_close
+        )
+
+        self.metrics_poll_job = self.after(
+            100,
+            self.poll_metrics_queue
         )
 
         self.update_metrics()
@@ -370,6 +382,105 @@ class SystemResourceMonitor(ctk.CTk):
 
         return value_label, subtitle_label
 
+    def create_gauge_card(self, parent, title, subtitle, column):
+        """Create a circular CPU/RAM usage indicator."""
+        card = ctk.CTkFrame(
+            parent,
+            fg_color=self.colors["card"],
+            corner_radius=12,
+            border_width=1,
+            border_color=self.colors["border"],
+            height=205
+        )
+        card.grid(
+            row=0,
+            column=column,
+            sticky="nsew",
+            padx=6,
+            pady=6
+        )
+        card.grid_propagate(False)
+
+        ctk.CTkLabel(
+            card,
+            text=title,
+            font=("Segoe UI", 11, "bold"),
+            text_color=self.colors["muted"]
+        ).pack(anchor="w", padx=15, pady=(13, 0))
+
+        gauge = tk.Canvas(
+            card,
+            width=118,
+            height=118,
+            bg=self.colors["card"],
+            highlightthickness=0,
+            bd=0
+        )
+        gauge.pack(pady=(0, 0))
+
+        # Background track and foreground usage arc.
+        gauge.create_arc(
+            10, 10, 108, 108,
+            start=90,
+            extent=359.9,
+            style="arc",
+            outline=self.colors["border"],
+            width=10
+        )
+        progress_id = gauge.create_arc(
+            10, 10, 108, 108,
+            start=90,
+            extent=0,
+            style="arc",
+            outline=self.colors["accent"],
+            width=10
+        )
+        value_id = gauge.create_text(
+            59, 59,
+            text="0.0%",
+            fill=self.colors["text"],
+            font=("Segoe UI", 17, "bold")
+        )
+
+        subtitle_label = ctk.CTkLabel(
+            card,
+            text=subtitle,
+            font=("Segoe UI", 10),
+            text_color=self.colors["muted"]
+        )
+        subtitle_label.pack(anchor="center", pady=(0, 10))
+
+        return gauge, progress_id, value_id, subtitle_label
+
+    def update_gauge(self, gauge_data, value, subtitle=None):
+        """Update an existing gauge without recreating its canvas items."""
+        canvas, progress_id, value_id, subtitle_label = gauge_data
+        percentage = max(0.0, min(100.0, float(value)))
+
+        if percentage >= 90:
+            gauge_color = self.colors["danger"]
+        elif percentage >= 70:
+            gauge_color = "#f59e0b"
+        else:
+            gauge_color = self.colors["accent"]
+
+        canvas.itemconfigure(
+            progress_id,
+            extent=-(percentage * 3.6),
+            outline=gauge_color
+        )
+        canvas.itemconfigure(
+            value_id,
+            text=f"{percentage:.1f}%"
+        )
+
+        if subtitle is not None:
+            self.update_label(
+                subtitle_label,
+                f"{'cpu' if gauge_data is self.cpu_gauge else 'memory'}_gauge_subtitle",
+                subtitle
+            )
+
     def create_metrics_section(self):
 
         self.metrics_section = ctk.CTkFrame(
@@ -396,24 +507,21 @@ class SystemResourceMonitor(ctk.CTk):
             self.metrics_section,
             fg_color="transparent"
         )
-
         cards_frame.pack(fill="x")
 
         for column in range(5):
             cards_frame.grid_columnconfigure(column, weight=1)
 
-        self.cpu_value, self.cpu_subtitle = self.create_metric_card(
+        self.cpu_gauge = self.create_gauge_card(
             cards_frame,
             "CPU USAGE",
-            "0%",
             "Processor utilization",
             0
         )
 
-        self.memory_value, self.memory_subtitle = self.create_metric_card(
+        self.memory_gauge = self.create_gauge_card(
             cards_frame,
             "MEMORY USAGE",
-            "0%",
             "RAM utilization",
             1
         )
@@ -442,21 +550,89 @@ class SystemResourceMonitor(ctk.CTk):
             4
         )
 
-    @profile_function
     def update_metrics(self):
+        """
+        Start metric collection in a worker thread.
 
+        This method runs on the Tkinter main thread, but the expensive
+        system queries run in the background.
+        """
+        if not self.running or self.metrics_loading:
+            return
+
+        self.metrics_loading = True
+
+        def collect_metrics():
+            start_time = time.perf_counter()
+
+            try:
+                metrics = self.monitor.get_metrics()
+                collection_time = time.perf_counter() - start_time
+
+                self.metrics_queue.put(
+                    (metrics, collection_time, None)
+                )
+
+            except Exception as error:
+                collection_time = time.perf_counter() - start_time
+
+                self.metrics_queue.put(
+                    (None, collection_time, str(error))
+                )
+
+        threading.Thread(
+            target=collect_metrics,
+            daemon=True,
+            name="MetricsCollector"
+        ).start()
+
+    def poll_metrics_queue(self):
+        """
+        Check for completed metric collection on the Tkinter main thread.
+
+        All widget updates remain on the main thread.
+        """
         if not self.running:
             return
 
         try:
+            metrics, collection_time, error = (
+                self.metrics_queue.get_nowait()
+            )
 
+        except queue.Empty:
+            metrics = None
+            collection_time = None
+            error = None
+
+        if collection_time is not None:
+            self.metrics_loading = False
+
+            if error:
+                print("Monitoring error:", error)
+            elif metrics is not None:
+                self.apply_metrics(metrics, collection_time)
+
+            # Schedule the next collection after the previous one finishes.
+            if self.running:
+                self.metrics_refresh_job = self.after(
+                    2000,
+                    self.update_metrics
+                )
+
+        if self.running:
+            self.metrics_poll_job = self.after(
+                100,
+                self.poll_metrics_queue
+            )
+
+    def apply_metrics(self, metrics, metrics_time):
+        """Update dashboard widgets using metrics collected in the worker."""
+        if not self.running:
+            return
+
+        try:
             total_start = time.perf_counter()
-
-            metrics_start = time.perf_counter()
-
-            metrics = self.monitor.get_metrics()
-
-            metrics_time = time.perf_counter() - metrics_start
 
             cpu = metrics["cpu"]
             memory = metrics["memory"]
@@ -465,32 +641,19 @@ class SystemResourceMonitor(ctk.CTk):
 
             labels_start = time.perf_counter()
 
-            self.update_label(
-                self.cpu_value,
-                "cpu_value",
-                f"{cpu['usage']:.1f}%"
-            )
-
-            self.update_label(
-                self.cpu_subtitle,
-                "cpu_subtitle",
+            self.update_gauge(
+                self.cpu_gauge,
+                cpu["usage"],
                 f"{cpu['cores']} cores / {cpu['threads']} threads"
             )
 
-            self.update_label(
-                self.memory_value,
-                "memory_value",
-                f"{memory['percent']:.1f}%"
-            )
-
-            self.update_label(
-                self.memory_subtitle,
-                "memory_subtitle",
+            self.update_gauge(
+                self.memory_gauge,
+                memory["percent"],
                 f"{format_bytes(memory['used'])} / {format_bytes(memory['total'])}"
             )
 
             if disks:
-
                 disk = disks[0]
 
                 self.update_label(
@@ -506,7 +669,6 @@ class SystemResourceMonitor(ctk.CTk):
                 )
 
             else:
-
                 self.update_label(
                     self.disk_value,
                     "disk_value",
@@ -543,15 +705,11 @@ class SystemResourceMonitor(ctk.CTk):
             }
 
             if current_history != self.previous_chart_history:
-
                 self.charts.update(history)
-
                 self.previous_chart_history = current_history
-
                 self.chart_canvas.draw_idle()
 
             chart_time = time.perf_counter() - chart_start
-
             total_time = time.perf_counter() - total_start
 
             print(
@@ -559,19 +717,11 @@ class SystemResourceMonitor(ctk.CTk):
                 f"Collection: {metrics_time * 1000:.2f} ms | "
                 f"Labels: {labels_time * 1000:.2f} ms | "
                 f"Charts: {chart_time * 1000:.2f} ms | "
-                f"Total: {total_time * 1000:.2f} ms"
+                f"UI Total: {total_time * 1000:.2f} ms"
             )
 
         except Exception as error:
-
-            print("Monitoring error:", error)
-
-        if self.running:
-
-            self.metrics_refresh_job = self.after(
-                2000,
-                self.update_metrics
-            )
+            print("Dashboard update error:", error)
 
     def create_charts_section(self):
 
@@ -715,6 +865,17 @@ class SystemResourceMonitor(ctk.CTk):
             padx=5
         )
 
+        self.process_count_label = ctk.CTkLabel(
+            controls,
+            text="Showing 0 processes",
+            font=("Segoe UI", 11),
+            text_color=self.colors["muted"]
+        )
+        self.process_count_label.pack(
+            side="left",
+            padx=(12, 5)
+        )
+
         ctk.CTkButton(
             controls,
             text="Terminate Process",
@@ -782,6 +943,18 @@ class SystemResourceMonitor(ctk.CTk):
             height=12
         )
 
+        # Highlight unusually resource-heavy processes.
+        self.process_table.tag_configure(
+            "high_cpu",
+            background="#54252d",
+            foreground="#ffffff"
+        )
+        self.process_table.tag_configure(
+            "high_memory",
+            background="#59421f",
+            foreground="#ffffff"
+        )
+
         headings = {
             "pid": ("PID", 80),
             "name": ("Process Name", 280),
@@ -829,6 +1002,21 @@ class SystemResourceMonitor(ctk.CTk):
             lambda event: self.terminate_selected_process()
         )
 
+        self.process_table.bind(
+            "<MouseWheel>",
+            self.on_process_table_mousewheel
+        )
+
+        self.process_table.bind(
+            "<Button-4>",
+            self.on_process_table_mousewheel
+        )
+
+        self.process_table.bind(
+            "<Button-5>",
+            self.on_process_table_mousewheel
+        )
+
     def search_process_table(self, event=None):
         self.update_process_table()
 
@@ -839,7 +1027,6 @@ class SystemResourceMonitor(ctk.CTk):
             return
 
         try:
-
             processes = self.cached_processes
 
             search_term = self.process_search.get()
@@ -857,7 +1044,10 @@ class SystemResourceMonitor(ctk.CTk):
                 "Process Name": "name"
             }
 
-            sort_key = sort_mapping[selected_sort]
+            sort_key = sort_mapping.get(
+                selected_sort,
+                "memory_percent"
+            )
 
             if sort_key == "name":
 
@@ -873,58 +1063,117 @@ class SystemResourceMonitor(ctk.CTk):
                     sort_key
                 )
 
-            existing_items = {
-                self.process_table.item(item, "values")[0]: item
-                for item in self.process_table.get_children()
-            }
+            total_processes = len(self.cached_processes)
+            visible_processes = len(processes)
 
-            current_pids = set()
+            count_text = (
+                f"Showing {visible_processes} "
+                f"of {total_processes} processes"
+            )
+
+            if self.process_count_label.cget("text") != count_text:
+                self.process_count_label.configure(
+                    text=count_text
+                )
+
+            existing_items = set(
+                self.process_table.get_children("")
+            )
+
+            ordered_items = []
 
             for process in processes:
 
                 pid = str(process["pid"])
-                current_pids.add(pid)
+
+                cpu_percent = float(
+                    process["cpu_percent"]
+                )
+
+                memory_percent = float(
+                    process["memory_percent"]
+                )
 
                 values = (
                     pid,
                     process["name"],
-                    f"{process['cpu_percent']:.1f}%",
-                    f"{process['memory_percent']:.2f}%",
+                    f"{cpu_percent:.1f}%",
+                    f"{memory_percent:.2f}%",
                     process["status"]
                 )
 
-                if pid in existing_items:
+                if cpu_percent >= 50:
+                    row_tag = "high_cpu"
 
-                    item = existing_items[pid]
+                elif memory_percent >= 20:
+                    row_tag = "high_memory"
 
-                    if self.process_table.item(item, "values") != values:
+                else:
+                    row_tag = ""
+
+                tags = (row_tag,) if row_tag else ()
+
+                if self.process_table.exists(pid):
+
+                    current_values = self.process_table.item(
+                        pid,
+                        "values"
+                    )
+
+                    if current_values != values:
+
                         self.process_table.item(
-                            item,
+                            pid,
                             values=values
                         )
 
-                    self.process_table.move(
-                        item,
-                        "",
-                        len(current_pids) - 1
+                    current_tags = self.process_table.item(
+                        pid,
+                        "tags"
                     )
+
+                    if current_tags != tags:
+
+                        self.process_table.item(
+                            pid,
+                            tags=tags
+                        )
 
                 else:
 
                     self.process_table.insert(
                         "",
                         "end",
-                        values=values
+                        iid=pid,
+                        values=values,
+                        tags=tags
                     )
 
-            for pid, item in existing_items.items():
+                ordered_items.append(pid)
 
-                if pid not in current_pids:
-                    self.process_table.delete(item)
+            desired_items = set(ordered_items)
+
+            for pid in existing_items - desired_items:
+
+                if self.process_table.exists(pid):
+
+                    self.process_table.delete(pid)
+
+            current_order = self.process_table.get_children("")
+
+            if current_order != tuple(ordered_items):
+
+                self.process_table.set_children(
+                    "",
+                    *ordered_items
+                )
 
         except Exception as error:
 
-            print("Process table error:", error)
+            print(
+                "Process table error:",
+                error
+            )
 
     def refresh_process_table(self):
 
@@ -1180,7 +1429,8 @@ class SystemResourceMonitor(ctk.CTk):
 
         for job in (
             self.process_refresh_job,
-            self.metrics_refresh_job
+            self.metrics_refresh_job,
+            self.metrics_poll_job
         ):
 
             if job is not None:
@@ -1191,6 +1441,27 @@ class SystemResourceMonitor(ctk.CTk):
                     pass
 
         self.destroy()
+    
+    def on_process_table_mousewheel(self, event):
+        if event.num == 4:
+            self.process_table.yview_scroll(-1, "units")
+
+        elif event.num == 5:
+            self.process_table.yview_scroll(1, "units")
+
+        else:
+            if abs(event.delta) >= 120:
+                direction = -int(event.delta / 120)
+            else:
+                direction = -int(event.delta)
+
+            if direction:
+                self.process_table.yview_scroll(
+                    direction,
+                    "units"
+                )
+
+        return "break"
 
 
 if __name__ == "__main__":

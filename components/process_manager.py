@@ -3,7 +3,6 @@ import psutil
 
 
 def get_processes():
-
     start_time = time.perf_counter()
 
     processes = []
@@ -13,15 +12,20 @@ def get_processes():
 
     loop_start = time.perf_counter()
 
-    for process in psutil.process_iter(
-        ["pid", "name", "status", "memory_info"]
-    ):
+    attributes = [
+        "pid",
+        "name",
+        "status",
+        "memory_info",
+        "cpu_percent"
+    ]
+
+    for process in psutil.process_iter(attrs=attributes):
 
         try:
-
             info = process.info
 
-            memory_info = info["memory_info"]
+            memory_info = info.get("memory_info")
 
             if memory_info and total_memory > 0:
                 memory_percent = (
@@ -30,13 +34,11 @@ def get_processes():
             else:
                 memory_percent = 0.0
 
-            cpu_percent = process.cpu_percent(interval=None)
-
             processes.append({
-                "pid": info["pid"],
-                "name": info["name"] or "Unknown",
-                "status": info["status"] or "Unknown",
-                "cpu_percent": cpu_percent,
+                "pid": info.get("pid"),
+                "name": info.get("name") or "Unknown",
+                "status": info.get("status") or "Unknown",
+                "cpu_percent": info.get("cpu_percent") or 0.0,
                 "memory_percent": memory_percent
             })
 
@@ -67,7 +69,6 @@ def get_processes():
 
 
 def search_processes(processes, search_term):
-
     search_term = search_term.lower().strip()
 
     if not search_term:
@@ -81,7 +82,6 @@ def search_processes(processes, search_term):
 
 
 def sort_processes(processes, sort_by="memory_percent"):
-
     return sorted(
         processes,
         key=lambda process: process.get(sort_by, 0),
@@ -90,11 +90,9 @@ def sort_processes(processes, sort_by="memory_percent"):
 
 
 def terminate_process(pid):
-
     process = psutil.Process(pid)
 
     process.terminate()
-
     process.wait(timeout=3)
 
     return True
